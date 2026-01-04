@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 from common import resize_with_padding
-from common.tracker import SimpleTracker
 from hailo_platform import (
     HEF,
     ConfigureParams,
@@ -18,6 +17,8 @@ from hailo_platform import (
     OutputVStreamParams,
     VDevice,
 )
+from boxmot import ByteTrack
+from common.tracker import SimpleTracker
 
 
 # INPUT_W = 1280
@@ -197,7 +198,7 @@ def create_video_writer(
     output_path = output_dir / f"detection_{timestamp}.mp4"
     gst_out = (
         f"appsrc ! videoconvert ! "
-        f'x265enc option-string="crf=28" speed-preset=fast tune=zerolatency ! '
+        f'x265enc option-string="crf=28" speed-preset=ultrafast tune=zerolatency ! '
         f"h265parse ! mp4mux ! filesink location={output_path}"
     )
     # gst_out = (
@@ -219,18 +220,28 @@ def run_live_detection(
     preview=True,
     enable_tracking=False,
     duration=None,
+    tracker_type: str = "bytetrack",
 ):
     with open(Path(__file__).parent / "common" / "coco_labels.txt", "r") as f:
         COCO_CLASSES = [line.strip() for line in f.readlines()]
 
     # Initialize tracker if enabled
-    tracker = (
-        SimpleTracker(max_age=30, min_hits=3, iou_threshold=0.3)
-        if enable_tracking
-        else None
-    )
+    tracker = None
+    tracker_kind = None
     if enable_tracking:
-        print("Object tracking enabled.")
+        if tracker_type.lower() == "simple":
+            tracker = SimpleTracker(max_age=30, min_hits=1, iou_threshold=0.2)
+            tracker_kind = "simple"
+            print("Object tracking enabled (SimpleTracker - lightweight).")
+        else:
+            tracker = ByteTrack(
+                track_thresh=0.5,
+                match_thresh=0.8,
+                track_buffer=30,
+                frame_rate=30,
+            )
+            tracker_kind = "bytetrack"
+            print("Object tracking enabled (ByteTrack).")
 
     # Initialize camera
     camera = Picamera2()
@@ -321,7 +332,97 @@ def run_live_detection(
 
                     # Apply tracking if enabled
                     if tracker is not None:
-                        detections = tracker.update(detections)
+                        # Convert detection dict to lists
+                        boxes = detections.get("boxes", [])
+                        scores = detections.get("scores", [])
+                        classes = detections.get("classes", [])
+
+                        # Default track_ids
+                        track_ids = [None] * len(boxes)
+
+                        if tracker_kind == "bytetrack":
+                            # ByteTrack expects a numpy array per-row: x1,y1,x2,y2,conf,cls
+                            if len(boxes) == 0:
+                                dets_array = np.empty((0, 6), dtype=np.float32)
+                            else:
+                                dets_array = np.zeros((len(boxes), 6), dtype=np.float32)
+                                for i, (box, score, cls) in enumerate(
+                                    zip(boxes, scores, classes)
+                                ):
+                                    dets_array[i, 0] = box[0]
+                                    dets_array[i, 1] = box[1]
+                                    dets_array[i, 2] = box[2]
+                                    dets_array[i, 3] = box[3]
+                                    dets_array[i, 4] = score
+                                    dets_array[i, 5] = cls
+
+                            # Call ByteTrack
+                            tracks_out = tracker.update(dets_array, original_frame)
+
+                            # Convert tracker output back into detection dict with track_ids aligned to input dets
+                            if (
+                                isinstance(tracks_out, np.ndarray)
+                                and tracks_out.size > 0
+                            ):
+                                # Expected format per row: [x1,y1,x2,y2, track_id, conf, cls, det_ind]
+                                for row in tracks_out:
+                                    det_ind = int(row[7]) if row.shape[0] > 7 else None
+                                    track_id = int(row[4])
+                                    if det_ind is not None and 0 <= det_ind < len(
+                                        boxes
+                                    ):
+                                        track_ids[det_ind] = track_id
+
+                        else:
+                            # SimpleTracker: pass detection dict, then map returned tracks back to input detections
+                            simple_out = tracker.update(
+                                {
+                                    "boxes": boxes,
+                                    "classes": classes,
+                                    "scores": scores,
+                                }
+                            )
+
+                            # Map each returned track box to the best-matching input detection by IoU
+                            out_boxes = simple_out.get("boxes", [])
+                            out_ids = simple_out.get("track_ids", [])
+                            if len(out_boxes) > 0 and len(boxes) > 0:
+                                arr_in = np.array(boxes, dtype=np.float32)
+                                arr_out = np.array(out_boxes, dtype=np.float32)
+                                # compute IoU matrix
+                                iou_matrix = np.zeros(
+                                    (arr_out.shape[0], arr_in.shape[0]),
+                                    dtype=np.float32,
+                                )
+                                for i in range(arr_out.shape[0]):
+                                    # vectorized IoU computation for each out box
+                                    x1 = np.maximum(arr_out[i, 0], arr_in[:, 0])
+                                    y1 = np.maximum(arr_out[i, 1], arr_in[:, 1])
+                                    x2 = np.minimum(arr_out[i, 2], arr_in[:, 2])
+                                    y2 = np.minimum(arr_out[i, 3], arr_in[:, 3])
+                                    inter_w = np.maximum(0, x2 - x1)
+                                    inter_h = np.maximum(0, y2 - y1)
+                                    inter = inter_w * inter_h
+                                    area_out = (arr_out[i, 2] - arr_out[i, 0]) * (
+                                        arr_out[i, 3] - arr_out[i, 1]
+                                    )
+                                    area_in = (arr_in[:, 2] - arr_in[:, 0]) * (
+                                        arr_in[:, 3] - arr_in[:, 1]
+                                    )
+                                    union = area_out + area_in - inter
+                                    iou_vals = np.where(union > 0, inter / union, 0.0)
+                                    iou_matrix[i] = iou_vals
+
+                                # For each out box, assign to input box with highest IoU (if above threshold)
+                                assigned_in = set()
+                                for i_out, ious in enumerate(iou_matrix):
+                                    best_idx = int(np.argmax(ious))
+                                    best_iou = float(ious[best_idx])
+                                    if best_iou >= 0.1 and best_idx not in assigned_in:
+                                        track_ids[best_idx] = int(out_ids[i_out])
+                                        assigned_in.add(best_idx)
+
+                        detections["track_ids"] = track_ids
 
                     # Log detections for cat, dog, person
                     video_filename = (
@@ -479,6 +580,13 @@ if __name__ == "__main__":
         help="Enable object tracking across frames",
     )
     parser.add_argument(
+        "--tracker-type",
+        type=str,
+        choices=["bytetrack", "simple"],
+        default="bytetrack",
+        help="Tracker implementation to use: 'bytetrack' (default) or 'simple' (lighter)",
+    )
+    parser.add_argument(
         "--duration",
         type=int,
         default=None,
@@ -493,6 +601,7 @@ if __name__ == "__main__":
         preview=args.preview,
         enable_tracking=args.track,
         duration=args.duration,
+        tracker_type=args.tracker_type,
     )
 
     print("Live detection stopped.")
