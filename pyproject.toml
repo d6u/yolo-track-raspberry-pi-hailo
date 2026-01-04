@@ -1,0 +1,13 @@
+[project]
+name = "pi-cat-monitor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "~=3.11.0"
+dependencies = [
+    "hailort",
+    "numpy~=1.0",
+]
+
+[tool.uv.sources]
+hailort = { path = "dependencies/hailort-4.23.0-cp311-cp311-linux_aarch64.whl" }
