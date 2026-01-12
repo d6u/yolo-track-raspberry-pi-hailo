@@ -19,6 +19,9 @@ from hailo_platform import (
 )
 from boxmot import ByteTrack
 from common.tracker import SimpleTracker
+from database.database import SessionLocal
+from database.model_detection import Detection
+from database.model_video_file import VideoFile
 
 
 # INPUT_W = 1280
@@ -282,8 +285,9 @@ def run_live_detection(
     video_writer = None
     video_start_time = None
     video_rotation_interval = 120  # seconds
-    output_dir = Path(__file__).parent / "recordings"
+    output_dir = Path(__file__).parent.parent / "recordings"
     current_video_path: Path | None = None
+    current_video_file_record: VideoFile | None = None
 
     # Detection logging setup
     output_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists for logging
@@ -298,6 +302,9 @@ def run_live_detection(
     # class_id -> last log time (for non-tracking mode)
     last_logged_time: dict[int, float] = {}
     log_cooldown = 5.0  # seconds between logging same class without tracking
+
+    # Database
+    db = SessionLocal()
 
     with InferVStreams(
         network_group, input_vstreams_params, output_vstreams_params
@@ -453,6 +460,14 @@ def run_live_detection(
                                         score,
                                     )
                                     logged_tracks.add(track_key)
+                                    # Create database record for detection
+                                    if current_video_file_record is not None:
+                                        detection_record = Detection(
+                                            name=class_name,
+                                            video_file_id=current_video_file_record.id,
+                                        )
+                                        db.add(detection_record)
+                                        db.commit()
                             else:
                                 # Without tracking: use cooldown to avoid spam
                                 last_time = last_logged_time.get(class_id, 0)
@@ -465,6 +480,14 @@ def run_live_detection(
                                         score,
                                     )
                                     last_logged_time[class_id] = current_time_log
+                                    # Create database record for detection
+                                    if current_video_file_record is not None:
+                                        detection_record = Detection(
+                                            name=class_name,
+                                            video_file_id=current_video_file_record.id,
+                                        )
+                                        db.add(detection_record)
+                                        db.commit()
 
                     original_frame = draw_detections(
                         original_frame, detections, COCO_CLASSES
@@ -539,6 +562,13 @@ def run_live_detection(
                         )
                         video_start_time = current_time
 
+                        # Create database record for new video file
+                        current_video_file_record = VideoFile(
+                            path=current_video_path.name
+                        )
+                        db.add(current_video_file_record)
+                        db.commit()
+
                     # Write frame to video
                     video_writer.write(original_frame)
 
@@ -596,7 +626,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_live_detection(
-        Path(__file__).parent / "models" / "yolov11l.hef",
+        Path(__file__).parent.parent / "models" / "yolov11l.hef",
         display_temp=args.display_temp,
         preview=args.preview,
         enable_tracking=args.track,
